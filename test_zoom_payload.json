@@ -1,0 +1,17 @@
+﻿{
+  "event": "recording.completed",
+  "payload": {
+    "object": {
+      "id": 89975460107,
+      "uuid": "TEST-UUID-89975460107",
+      "start_time": "2025-12-09T13:30:00Z",
+      "recording_files": [
+        {
+          "id": "fake-file-id",
+          "recording_type": "audio_only",
+          "download_url": "https://example.com/fake-audio-url"
+        }
+      ]
+    }
+  }
+}
