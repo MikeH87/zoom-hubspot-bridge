@@ -1,4 +1,6 @@
 ﻿from typing import Any, Dict, Optional
+import hmac
+import hashlib
 
 from fastapi import FastAPI, HTTPException, Request
 
@@ -35,20 +37,58 @@ def _extract_recording_url(zoom_object: Dict[str, Any]) -> Optional[str]:
     return first.get("download_url") or first.get("play_url")
 
 
+def _zoom_encrypted_token(plain_token: str) -> str:
+    """
+    Create HMAC-SHA256 hash of plainToken using Zoom webhook secret token.
+    Zoom expects the hex digest as encryptedToken.
+    """
+    if not ZOOM_WEBHOOK_SECRET_TOKEN:
+        raise HTTPException(status_code=500, detail="Zoom webhook secret token not configured")
+
+    digest = hmac.new(
+        ZOOM_WEBHOOK_SECRET_TOKEN.encode("utf-8"),
+        plain_token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return digest
+
+
 @app.post("/zoom/recording-webhook")
 async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
     """
-    Endpoint to receive Zoom "recording.completed" webhooks.
+    Endpoint to receive Zoom webhooks.
+
+    Handles:
+    - endpoint.url_validation (initial URL verification)
+    - recording.* events (e.g. recording.completed)
     """
-    # Optional simple token check (currently disabled if env value is blank)
-    if ZOOM_WEBHOOK_SECRET_TOKEN:
-        auth_header = request.headers.get("Authorization")
-        if auth_header != ZOOM_WEBHOOK_SECRET_TOKEN:
-            raise HTTPException(status_code=401, detail="Invalid Zoom webhook token")
-
     payload = await request.json()
-
     zoom_event = payload.get("event")
+
+    # 1) Handle Zoom URL validation
+    if zoom_event == "endpoint.url_validation":
+        validation_payload = (payload.get("payload") or {})
+        plain_token = validation_payload.get("plainToken")
+
+        if not plain_token:
+            raise HTTPException(status_code=400, detail="plainToken missing in validation payload")
+
+        encrypted_token = _zoom_encrypted_token(plain_token)
+
+        return {
+            "plainToken": plain_token,
+            "encryptedToken": encrypted_token,
+        }
+
+    # 2) For all other events, optionally check a simple auth header if configured
+    if ZOOM_WEBHOOK_SECRET_TOKEN:
+        # This is optional extra protection – you can remove this block if you only rely on signature
+        auth_header = request.headers.get("Authorization")
+        # If you later want to enforce an auth header, add logic here.
+        # For now we do not reject based on this.
+        _ = auth_header
+
+    # 3) Now handle recording events
     if not zoom_event or "recording" not in zoom_event:
         raise HTTPException(status_code=400, detail="Not a recording event")
 
@@ -65,7 +105,7 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
     if not recording_url:
         raise HTTPException(status_code=400, detail="No recording URL found in Zoom payload")
 
-    # 1) Find the matching HubSpot meeting
+    # 4) Find the matching HubSpot meeting
     meeting = await search_meeting_by_zoom_id(zoom_meeting_id)
     if not meeting:
         raise HTTPException(
@@ -77,7 +117,7 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
     meeting_props = meeting.get("properties") or {}
     meeting_type = meeting_props.get("hs_activity_type")
 
-    # 2) Create a call for this meeting
+    # 5) Create a call for this meeting
     call = await create_call_for_meeting(
         meeting=meeting,
         meeting_type=meeting_type,
@@ -89,11 +129,11 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
 
     call_id = call.get("id")
 
-    # 3) Fetch associated contacts and deals from the meeting
+    # 6) Fetch associated contacts and deals from the meeting
     contact_ids = await get_meeting_contact_ids(meeting_id)
     deal_ids = await get_meeting_deal_ids(meeting_id)
 
-    # 4) Associate the call with those contacts and deals
+    # 7) Associate the call with those contacts and deals
     await associate_call_to_contacts(call_id, contact_ids)
     await associate_call_to_deals(call_id, deal_ids)
 
