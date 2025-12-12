@@ -80,15 +80,7 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
             "encryptedToken": encrypted_token,
         }
 
-    # 2) For all other events, optionally check a simple auth header if configured
-    if ZOOM_WEBHOOK_SECRET_TOKEN:
-        # This is optional extra protection – you can remove this block if you only rely on signature
-        auth_header = request.headers.get("Authorization")
-        # If you later want to enforce an auth header, add logic here.
-        # For now we do not reject based on this.
-        _ = auth_header
-
-    # 3) Now handle recording events
+    # 2) Now handle recording events
     if not zoom_event or "recording" not in zoom_event:
         raise HTTPException(status_code=400, detail="Not a recording event")
 
@@ -105,19 +97,24 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
     if not recording_url:
         raise HTTPException(status_code=400, detail="No recording URL found in Zoom payload")
 
-    # 4) Find the matching HubSpot meeting
+    # 3) Find the matching HubSpot meeting
     meeting = await search_meeting_by_zoom_id(zoom_meeting_id)
     if not meeting:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No HubSpot meeting found with Zoom meeting ID {zoom_meeting_id}",
-        )
+        # IMPORTANT CHANGE:
+        # If there is no matching meeting in HubSpot, we IGNORE this recording.
+        # This prevents internal/training Zoom calls (that aren't scheduled in HubSpot)
+        # from generating call records.
+        print(f"No HubSpot meeting found for Zoom meeting ID {zoom_meeting_id}. Ignoring webhook.")
+        return {
+            "status": "ignored_no_matching_meeting",
+            "zoom_meeting_id": zoom_meeting_id,
+        }
 
     meeting_id = meeting.get("id")
     meeting_props = meeting.get("properties") or {}
     meeting_type = meeting_props.get("hs_activity_type")
 
-    # 5) Create a call for this meeting
+    # 4) Create a call for this meeting
     call = await create_call_for_meeting(
         meeting=meeting,
         meeting_type=meeting_type,
@@ -129,11 +126,11 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
 
     call_id = call.get("id")
 
-    # 6) Fetch associated contacts and deals from the meeting
+    # 5) Fetch associated contacts and deals from the meeting
     contact_ids = await get_meeting_contact_ids(meeting_id)
     deal_ids = await get_meeting_deal_ids(meeting_id)
 
-    # 7) Associate the call with those contacts and deals
+    # 6) Associate the call with those contacts and deals
     await associate_call_to_contacts(call_id, contact_ids)
     await associate_call_to_deals(call_id, deal_ids)
 
