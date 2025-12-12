@@ -59,6 +59,26 @@ def _iso_to_epoch_ms(iso_str: Optional[str]) -> int:
         return int(datetime.datetime.utcnow().timestamp() * 1000)
 
 
+async def get_contact_name(contact_id: str) -> Optional[str]:
+    """
+    Returns 'First Last' if available, otherwise best-effort name.
+    """
+    url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{contact_id}?properties=firstname,lastname"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(url, headers=HEADERS)
+        if resp.status_code >= 400:
+            return None
+        data = resp.json()
+
+    props = data.get("properties") or {}
+    first = (props.get("firstname") or "").strip()
+    last = (props.get("lastname") or "").strip()
+
+    full = f"{first} {last}".strip()
+    return full or None
+
+
 async def get_meeting_contact_ids(meeting_id: str) -> List[str]:
     url = f"{HUBSPOT_BASE_URL}/crm/v4/objects/meetings/{meeting_id}/associations/contacts"
 
@@ -107,17 +127,22 @@ async def create_call_for_meeting(
     zoom_start_time: Optional[str],
     duration_ms: Optional[int] = None,
     disposition: str = "",
+    primary_contact_name: Optional[str] = None,
 ) -> dict:
     """
     Create a HubSpot call record representing a Zoom meeting recording.
-
-    IMPORTANT:
-    - disposition must go into hs_call_disposition (your internal option IDs)
-    - duration_ms goes into hs_call_duration (milliseconds)
     """
     url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/calls"
 
     timestamp_ms = _iso_to_epoch_ms(zoom_start_time)
+
+    # Title format: "First Last – Zoom int – Call Type"
+    if primary_contact_name:
+        call_title = f"{primary_contact_name} – Zoom int – {meeting_type or ''}".strip()
+        call_title = call_title.rstrip(" –")
+    else:
+        call_title = f"Zoom int – {meeting_type or ''}".strip()
+        call_title = call_title.rstrip(" –")
 
     properties = {
         "hs_timestamp": timestamp_ms,
@@ -125,7 +150,7 @@ async def create_call_for_meeting(
         "hs_call_direction": "OUTBOUND",
         "hs_call_recording_url": recording_url,
         "hs_activity_type": meeting_type or "",
-        "hs_call_title": f"Zoom Call (Meeting Recording) - {meeting_type or ''}".strip(" -"),
+        "hs_call_title": call_title,
         "hs_call_body": f"Integration-created call record for Zoom meeting ID {zoom_meeting_id}. This mirrors the HubSpot meeting activity and exists to attach recording + analysis.",
         "zoom_meeting_id": zoom_meeting_id,
         "integration_call": True,
@@ -150,14 +175,10 @@ async def create_call_for_meeting(
 
 async def associate_call_to_contacts(call_id: str, contact_ids: List[str]) -> None:
     if not contact_ids:
-        print("No contacts to associate.")
         return
 
     url = f"{HUBSPOT_BASE_URL}/crm/associations/2025-09/Calls/Contacts/batch/associate/default"
-
-    payload = {
-        "inputs": [{"from": {"id": call_id}, "to": {"id": cid}} for cid in contact_ids]
-    }
+    payload = {"inputs": [{"from": {"id": call_id}, "to": {"id": cid}} for cid in contact_ids]}
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(url, json=payload, headers=HEADERS)
@@ -170,14 +191,10 @@ async def associate_call_to_contacts(call_id: str, contact_ids: List[str]) -> No
 
 async def associate_call_to_deals(call_id: str, deal_ids: List[str]) -> None:
     if not deal_ids:
-        print("No deals to associate.")
         return
 
     url = f"{HUBSPOT_BASE_URL}/crm/associations/2025-09/Calls/Deals/batch/associate/default"
-
-    payload = {
-        "inputs": [{"from": {"id": call_id}, "to": {"id": did}} for did in deal_ids]
-    }
+    payload = {"inputs": [{"from": {"id": call_id}, "to": {"id": did}} for did in deal_ids]}
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(url, json=payload, headers=HEADERS)
@@ -186,5 +203,3 @@ async def associate_call_to_deals(call_id: str, deal_ids: List[str]) -> None:
         print("Error associating call to deals (default):")
         print("Status:", resp.status_code)
         print("Body:", resp.text)
-
-

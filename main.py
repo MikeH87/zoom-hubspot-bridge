@@ -1,4 +1,4 @@
-﻿from typing import Any, Dict, Optional
+﻿from typing import Any, Dict, Optional, List
 import hmac
 import hashlib
 
@@ -10,6 +10,7 @@ from hubspot_client import (
     create_call_for_meeting,
     get_meeting_contact_ids,
     get_meeting_deal_ids,
+    get_contact_name,
     associate_call_to_contacts,
     associate_call_to_deals,
 )
@@ -18,28 +19,14 @@ from zoom_client import get_participant_count
 
 app = FastAPI()
 
-# HubSpot call disposition internal values you provided
 DISPOSITION_CONNECTED = "f240bbac-87c9-4f6e-bf70-924b57d47db7"
 DISPOSITION_NO_ANSWER = "73a0d17f-1163-4015-bdd5-ec830791da20"
 
-
-def _extract_recording_url(zoom_object: Dict[str, Any]) -> Optional[str]:
-    recording_files = zoom_object.get("recording_files") or []
-    if not recording_files:
-        return None
-
-    for rf in recording_files:
-        if rf.get("recording_type") == "audio_only":
-            return rf.get("download_url") or rf.get("play_url")
-
-    first = recording_files[0]
-    return first.get("download_url") or first.get("play_url")
+# Only allow real media types (ignore transcript/chat/cc/etc)
+ALLOWED_MEDIA_FILE_TYPES = {"M4A", "MP4", "MP3", "WAV"}
 
 
 def _extract_duration_ms(zoom_object: Dict[str, Any]) -> int:
-    """
-    Zoom 'duration' is in minutes. Convert to milliseconds.
-    """
     duration_minutes = zoom_object.get("duration")
     try:
         if duration_minutes is None:
@@ -50,6 +37,59 @@ def _extract_duration_ms(zoom_object: Dict[str, Any]) -> int:
         return int(minutes * 60 * 1000)
     except Exception:
         return 0
+
+
+def _choose_media_recording_file(recording_files: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Selection rules:
+    - Only accept file_type in: M4A (preferred), MP4, MP3, WAV
+    - Ignore transcript/JSON/TXT/VTT/CHAT etc by file_type filter
+    - Prefer audio_only recordings first (and M4A if present)
+    - Otherwise choose the smallest MP4 (by file_size if present)
+    """
+    if not recording_files:
+        return None
+
+    # Filter to media only
+    media = []
+    for rf in recording_files:
+        ft = (rf.get("file_type") or "").upper().strip()
+        if ft in ALLOWED_MEDIA_FILE_TYPES:
+            media.append(rf)
+
+    if not media:
+        return None
+
+    # Prefer audio_only first
+    audio_only = [rf for rf in media if (rf.get("recording_type") == "audio_only")]
+    if audio_only:
+        # Prefer M4A inside audio_only
+        m4a = [rf for rf in audio_only if (str(rf.get("file_type") or "").upper() == "M4A")]
+        if m4a:
+            return m4a[0]
+        return audio_only[0]
+
+    # Otherwise: smallest MP4
+    mp4s = [rf for rf in media if (str(rf.get("file_type") or "").upper() == "MP4")]
+    if mp4s:
+        def size_or_big(x: Dict[str, Any]) -> int:
+            try:
+                return int(x.get("file_size") or 10**18)
+            except Exception:
+                return 10**18
+        mp4s.sort(key=size_or_big)
+        return mp4s[0]
+
+    # Else fall back to first remaining media file
+    return media[0]
+
+
+def _extract_media_download_url(zoom_object: Dict[str, Any]) -> Optional[str]:
+    recording_files = zoom_object.get("recording_files") or []
+    chosen = _choose_media_recording_file(recording_files)
+    if not chosen:
+        return None
+    return chosen.get("download_url") or chosen.get("play_url")
 
 
 def _zoom_encrypted_token(plain_token: str) -> str:
@@ -69,19 +109,15 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
     payload = await request.json()
     zoom_event = payload.get("event")
 
-    # 1) Handle Zoom URL validation
+    # URL validation
     if zoom_event == "endpoint.url_validation":
         validation_payload = (payload.get("payload") or {})
         plain_token = validation_payload.get("plainToken")
-
         if not plain_token:
             raise HTTPException(status_code=400, detail="plainToken missing in validation payload")
+        return {"plainToken": plain_token, "encryptedToken": _zoom_encrypted_token(plain_token)}
 
-        encrypted_token = _zoom_encrypted_token(plain_token)
-
-        return {"plainToken": plain_token, "encryptedToken": encrypted_token}
-
-    # 2) Handle recording events
+    # Recording events only
     if not zoom_event or "recording" not in zoom_event:
         raise HTTPException(status_code=400, detail="Not a recording event")
 
@@ -94,11 +130,16 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
     if not zoom_meeting_id:
         raise HTTPException(status_code=400, detail="Zoom meeting ID is missing")
 
-    recording_url = _extract_recording_url(zoom_object)
+    # STRICT media URL selection
+    recording_url = _extract_media_download_url(zoom_object)
     if not recording_url:
-        raise HTTPException(status_code=400, detail="No recording URL found in Zoom payload")
+        print(f"No media recording file found for meeting {zoom_meeting_id}")
+        return {
+            "status": "ignored_no_media_recording_file",
+            "zoom_meeting_id": zoom_meeting_id,
+        }
 
-    # If there is no matching meeting in HubSpot, ignore the webhook
+    # Match HubSpot meeting
     meeting = await search_meeting_by_zoom_id(zoom_meeting_id)
     if not meeting:
         print(f"No HubSpot meeting found for Zoom meeting ID {zoom_meeting_id}. Ignoring webhook.")
@@ -108,7 +149,7 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
     meeting_props = meeting.get("properties") or {}
     meeting_type = meeting_props.get("hs_activity_type")
 
-    # SAFEGUARD: If HubSpot meeting has no activity type, do not create a call
+    # SAFEGUARD: require activity type
     if not meeting_type:
         print(f"HubSpot meeting {meeting_id} has no hs_activity_type. Ignoring webhook.")
         return {
@@ -116,24 +157,33 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
             "hubspot_meeting_id": meeting_id,
             "zoom_meeting_id": zoom_meeting_id,
         }
-# 3) Determine disposition using Zoom participant count (past meeting API)
+
+    # Get associations FIRST (so we can name the call using primary contact)
+    contact_ids = await get_meeting_contact_ids(meeting_id)
+    deal_ids = await get_meeting_deal_ids(meeting_id)
+
+    primary_contact_name = None
+    if contact_ids:
+        try:
+            primary_contact_name = await get_contact_name(contact_ids[0])
+        except Exception as e:
+            print("Failed to fetch primary contact name:", repr(e))
+
+    # Determine disposition via participants (if available)
     disposition = DISPOSITION_CONNECTED
     participant_count = None
-
     if zoom_meeting_uuid:
         try:
             participant_count = await get_participant_count(zoom_meeting_uuid)
             if participant_count <= 1:
                 disposition = DISPOSITION_NO_ANSWER
         except Exception as e:
-            # If Zoom API fails, default to Connected (safer than marking No Answer incorrectly)
             print("Zoom participant lookup failed; defaulting disposition to CONNECTED.")
             print("Error:", repr(e))
 
-    # 4) Duration
     duration_ms = _extract_duration_ms(zoom_object)
 
-    # 5) Create call with duration + disposition
+    # Create call with better title format
     call = await create_call_for_meeting(
         meeting=meeting,
         meeting_type=meeting_type,
@@ -143,13 +193,10 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
         zoom_start_time=zoom_start_time,
         duration_ms=duration_ms,
         disposition=disposition,
+        primary_contact_name=primary_contact_name,
     )
 
     call_id = call.get("id")
-
-    # 6) Associate to contacts + deals
-    contact_ids = await get_meeting_contact_ids(meeting_id)
-    deal_ids = await get_meeting_deal_ids(meeting_id)
 
     await associate_call_to_contacts(call_id, contact_ids)
     await associate_call_to_deals(call_id, deal_ids)
@@ -167,4 +214,3 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
-
