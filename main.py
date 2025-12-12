@@ -22,7 +22,14 @@ from zoom_client import get_participant_count, get_meeting_recordings, stream_re
 
 app = FastAPI()
 
-DISPOSITION_CONNECTED = "f240bbac-87c9-4f6e-bf70-924b57d47db7"
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def _log_unhandled_exception(request: Request, exc: Exception):
+    print("UNHANDLED EXCEPTION:", repr(exc))
+    import traceback
+    traceback.print_exc()
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})DISPOSITION_CONNECTED = "f240bbac-87c9-4f6e-bf70-924b57d47db7"
 DISPOSITION_NO_ANSWER = "73a0d17f-1163-4015-bdd5-ec830791da20"
 
 ALLOWED_MEDIA_FILE_TYPES = {"M4A", "MP4", "MP3", "WAV"}
@@ -272,3 +279,4 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
+
