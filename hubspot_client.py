@@ -125,7 +125,10 @@ async def create_call_for_meeting(
         "hs_call_direction": "OUTBOUND",
         "hs_call_recording_url": recording_url,
         "hs_activity_type": meeting_type or "",
+        "hs_call_title": f"Zoom Call (Meeting Recording) - {meeting_type or '}".strip(" -"),
+        "hs_call_body": f"Integration-created call record for Zoom meeting ID {zoom_meeting_id}. This mirrors the HubSpot meeting activity and exists to attach recording + analysis.",
         "zoom_meeting_id": zoom_meeting_id,
+        "integration_call": True,
         "hs_call_duration": duration_ms if duration_ms is not None else 0,
     }
 
@@ -183,3 +186,4 @@ async def associate_call_to_deals(call_id: str, deal_ids: List[str]) -> None:
         print("Error associating call to deals (default):")
         print("Status:", resp.status_code)
         print("Body:", resp.text)
+
