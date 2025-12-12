@@ -108,7 +108,15 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
     meeting_props = meeting.get("properties") or {}
     meeting_type = meeting_props.get("hs_activity_type")
 
-    # 3) Determine disposition using Zoom participant count (past meeting API)
+    # SAFEGUARD: If HubSpot meeting has no activity type, do not create a call
+    if not meeting_type:
+        print(f"HubSpot meeting {meeting_id} has no hs_activity_type. Ignoring webhook.")
+        return {
+            "status": "ignored_missing_activity_type",
+            "hubspot_meeting_id": meeting_id,
+            "zoom_meeting_id": zoom_meeting_id,
+        }
+# 3) Determine disposition using Zoom participant count (past meeting API)
     disposition = DISPOSITION_CONNECTED
     participant_count = None
 
@@ -159,3 +167,4 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
+
