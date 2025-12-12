@@ -79,10 +79,7 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
 
         encrypted_token = _zoom_encrypted_token(plain_token)
 
-        return {
-            "plainToken": plain_token,
-            "encryptedToken": encrypted_token,
-        }
+        return {"plainToken": plain_token, "encryptedToken": encrypted_token}
 
     # 2) Handle recording events
     if not zoom_event or "recording" not in zoom_event:
@@ -137,7 +134,7 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
         zoom_meeting_uuid=zoom_meeting_uuid,
         zoom_start_time=zoom_start_time,
         duration_ms=duration_ms,
-        call_outcome=disposition,  # we'll map this inside hubspot_client to hs_call_disposition
+        disposition=disposition,
     )
 
     call_id = call.get("id")
@@ -162,4 +159,3 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
-
