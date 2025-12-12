@@ -1,5 +1,5 @@
 ﻿import httpx
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, parse_qsl, urlencode, urlunparse
 
 from config import (
     ZOOM_ACCOUNT_ID,
@@ -30,8 +30,7 @@ async def get_zoom_access_token() -> str:
 
 def _encode_meeting_uuid_for_path(meeting_uuid: str) -> str:
     """
-    Zoom requires the meeting UUID to be URL-encoded when used in path params.
-    In some cases Zoom expects it to be double-encoded. We'll do that to be safe.
+    Zoom requires the meeting UUID to be URL-encoded (often double-encoded) in path params.
     """
     once = quote(meeting_uuid, safe="")
     twice = quote(once, safe="")
@@ -39,10 +38,6 @@ def _encode_meeting_uuid_for_path(meeting_uuid: str) -> str:
 
 
 async def get_participant_count(meeting_uuid: str) -> int:
-    """
-    Fetch participant list from Zoom's 'past meeting participants' API.
-    Return the number of unique participants.
-    """
     token = await get_zoom_access_token()
     safe_uuid = _encode_meeting_uuid_for_path(meeting_uuid)
 
@@ -52,19 +47,14 @@ async def get_participant_count(meeting_uuid: str) -> int:
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(url, headers=headers)
 
-    # If Zoom doesn’t have the past meeting yet / no access, treat as host-only
     if resp.status_code == 404:
         return 1
 
     if resp.status_code >= 400:
-        # Print useful detail for debugging in Render logs
         print("Zoom participants API error:")
         print("URL:", url)
         print("Status:", resp.status_code)
-        try:
-            print("Body:", resp.text)
-        except Exception:
-            pass
+        print("Body:", resp.text)
         resp.raise_for_status()
 
     data = resp.json()
@@ -72,8 +62,68 @@ async def get_participant_count(meeting_uuid: str) -> int:
 
     unique = set()
     for p in participants:
-        name = p.get("name")
-        email = p.get("user_email")
-        unique.add((name, email))
+        unique.add((p.get("name"), p.get("user_email")))
 
     return len(unique)
+
+
+async def get_meeting_recordings(meeting_id: str) -> dict:
+    """
+    Returns Zoom 'Get meeting recordings' response for a given meeting_id.
+    Requires recording scopes on your S2S app.
+    """
+    token = await get_zoom_access_token()
+    url = f"{ZOOM_BASE_URL}/meetings/{meeting_id}/recordings"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(url, headers=headers)
+
+    if resp.status_code >= 400:
+        print("Zoom meeting recordings API error:")
+        print("URL:", url)
+        print("Status:", resp.status_code)
+        print("Body:", resp.text)
+        resp.raise_for_status()
+
+    return resp.json()
+
+
+def _with_access_token_param(download_url: str, access_token: str) -> str:
+    """
+    Some Zoom recording downloads require access_token as a query param.
+    We add it without clobbering existing params.
+    """
+    parts = urlparse(download_url)
+    q = dict(parse_qsl(parts.query, keep_blank_values=True))
+    q["access_token"] = access_token
+    new_query = urlencode(q)
+    return urlunparse((parts.scheme, parts.netloc, parts.path, parts.params, new_query, parts.fragment))
+
+
+async def stream_recording_bytes(download_url: str):
+    """
+    Stream bytes from Zoom recording download_url using OAuth token.
+    We try:
+    1) Authorization: Bearer
+    2) If that fails, retry with ?access_token=... (some setups require it)
+    Returns (response_headers, async_byte_iterator)
+    """
+    token = await get_zoom_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    client = httpx.AsyncClient(timeout=None, follow_redirects=True)
+
+    # Attempt 1: Bearer header
+    resp = await client.get(download_url, headers=headers)
+    if resp.status_code in (401, 403):
+        # Attempt 2: access_token query param
+        alt = _with_access_token_param(download_url, token)
+        resp = await client.get(alt)
+
+    if resp.status_code >= 400:
+        body = await resp.aread()
+        await client.aclose()
+        raise RuntimeError(f"Zoom download failed {resp.status_code}: {body[:200]!r}")
+
+    return client, resp

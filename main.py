@@ -1,10 +1,13 @@
 ﻿from typing import Any, Dict, Optional, List
 import hmac
 import hashlib
+import time
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
-from config import ZOOM_WEBHOOK_SECRET_TOKEN
+from config import ZOOM_WEBHOOK_SECRET_TOKEN, MEDIA_PROXY_SECRET, PUBLIC_BASE_URL
 from hubspot_client import (
     search_meeting_by_zoom_id,
     create_call_for_meeting,
@@ -14,7 +17,7 @@ from hubspot_client import (
     associate_call_to_contacts,
     associate_call_to_deals,
 )
-from zoom_client import get_participant_count
+from zoom_client import get_participant_count, get_meeting_recordings, stream_recording_bytes
 
 
 app = FastAPI()
@@ -22,7 +25,6 @@ app = FastAPI()
 DISPOSITION_CONNECTED = "f240bbac-87c9-4f6e-bf70-924b57d47db7"
 DISPOSITION_NO_ANSWER = "73a0d17f-1163-4015-bdd5-ec830791da20"
 
-# Only allow real media types (ignore transcript/chat/cc/etc)
 ALLOWED_MEDIA_FILE_TYPES = {"M4A", "MP4", "MP3", "WAV"}
 
 
@@ -50,7 +52,6 @@ def _choose_media_recording_file(recording_files: List[Dict[str, Any]]) -> Optio
     if not recording_files:
         return None
 
-    # Filter to media only
     media = []
     for rf in recording_files:
         ft = (rf.get("file_type") or "").upper().strip()
@@ -60,16 +61,11 @@ def _choose_media_recording_file(recording_files: List[Dict[str, Any]]) -> Optio
     if not media:
         return None
 
-    # Prefer audio_only first
     audio_only = [rf for rf in media if (rf.get("recording_type") == "audio_only")]
     if audio_only:
-        # Prefer M4A inside audio_only
         m4a = [rf for rf in audio_only if (str(rf.get("file_type") or "").upper() == "M4A")]
-        if m4a:
-            return m4a[0]
-        return audio_only[0]
+        return m4a[0] if m4a else audio_only[0]
 
-    # Otherwise: smallest MP4
     mp4s = [rf for rf in media if (str(rf.get("file_type") or "").upper() == "MP4")]
     if mp4s:
         def size_or_big(x: Dict[str, Any]) -> int:
@@ -80,16 +76,7 @@ def _choose_media_recording_file(recording_files: List[Dict[str, Any]]) -> Optio
         mp4s.sort(key=size_or_big)
         return mp4s[0]
 
-    # Else fall back to first remaining media file
     return media[0]
-
-
-def _extract_media_download_url(zoom_object: Dict[str, Any]) -> Optional[str]:
-    recording_files = zoom_object.get("recording_files") or []
-    chosen = _choose_media_recording_file(recording_files)
-    if not chosen:
-        return None
-    return chosen.get("download_url") or chosen.get("play_url")
 
 
 def _zoom_encrypted_token(plain_token: str) -> str:
@@ -102,6 +89,71 @@ def _zoom_encrypted_token(plain_token: str) -> str:
         hashlib.sha256,
     ).hexdigest()
     return digest
+
+
+def _proxy_sig(meeting_id: str, file_id: str, exp: int) -> str:
+    if not MEDIA_PROXY_SECRET:
+        raise HTTPException(status_code=500, detail="MEDIA_PROXY_SECRET not configured")
+    msg = f"{meeting_id}:{file_id}:{exp}".encode("utf-8")
+    return hmac.new(MEDIA_PROXY_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def _build_proxy_url(meeting_id: str, file_id: str, exp: int) -> str:
+    sig = _proxy_sig(meeting_id, file_id, exp)
+    # Encode file_id for safety (it can contain special chars)
+    return (
+        f"{PUBLIC_BASE_URL}/recordings/proxy"
+        f"?meeting_id={quote(str(meeting_id))}"
+        f"&file_id={quote(str(file_id))}"
+        f"&exp={exp}"
+        f"&sig={sig}"
+    )
+
+
+@app.get("/recordings/proxy")
+async def recordings_proxy(meeting_id: str, file_id: str, exp: int, sig: str):
+    """
+    Secure proxy for AI worker:
+    - validates HMAC signature + expiry
+    - fetches the real Zoom download_url via Zoom API
+    - streams the bytes back to the caller
+    """
+    now = int(time.time())
+    if exp < now:
+        raise HTTPException(status_code=403, detail="Link expired")
+
+    expected = _proxy_sig(meeting_id, file_id, exp)
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(status_code=403, detail="Bad signature")
+
+    data = await get_meeting_recordings(meeting_id)
+    recording_files = data.get("recording_files") or []
+
+    chosen = None
+    for rf in recording_files:
+        if str(rf.get("id") or "") == str(file_id):
+            chosen = rf
+            break
+
+    if not chosen:
+        raise HTTPException(status_code=404, detail="Recording file not found")
+
+    download_url = chosen.get("download_url")
+    if not download_url:
+        raise HTTPException(status_code=404, detail="No download_url for recording file")
+
+    client, resp = await stream_recording_bytes(download_url)
+
+    content_type = resp.headers.get("content-type") or "application/octet-stream"
+
+    async def _iter():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await client.aclose()
+
+    return StreamingResponse(_iter(), media_type=content_type)
 
 
 @app.post("/zoom/recording-webhook")
@@ -130,14 +182,21 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
     if not zoom_meeting_id:
         raise HTTPException(status_code=400, detail="Zoom meeting ID is missing")
 
-    # STRICT media URL selection
-    recording_url = _extract_media_download_url(zoom_object)
-    if not recording_url:
+    # STRICT media selection (from payload)
+    recording_files = zoom_object.get("recording_files") or []
+    chosen = _choose_media_recording_file(recording_files)
+    if not chosen:
         print(f"No media recording file found for meeting {zoom_meeting_id}")
-        return {
-            "status": "ignored_no_media_recording_file",
-            "zoom_meeting_id": zoom_meeting_id,
-        }
+        return {"status": "ignored_no_media_recording_file", "zoom_meeting_id": zoom_meeting_id}
+
+    recording_file_id = chosen.get("id")
+    if not recording_file_id:
+        print(f"No recording file id found for meeting {zoom_meeting_id}")
+        return {"status": "ignored_no_recording_file_id", "zoom_meeting_id": zoom_meeting_id}
+
+    # Store PROXY url in HubSpot (AI worker downloads from us, we fetch from Zoom)
+    exp = int(time.time()) + (7 * 24 * 60 * 60)  # 7 days
+    proxy_url = _build_proxy_url(zoom_meeting_id, str(recording_file_id), exp)
 
     # Match HubSpot meeting
     meeting = await search_meeting_by_zoom_id(zoom_meeting_id)
@@ -183,11 +242,10 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
 
     duration_ms = _extract_duration_ms(zoom_object)
 
-    # Create call with better title format
     call = await create_call_for_meeting(
         meeting=meeting,
         meeting_type=meeting_type,
-        recording_url=recording_url,
+        recording_url=proxy_url,
         zoom_meeting_id=zoom_meeting_id,
         zoom_meeting_uuid=zoom_meeting_uuid,
         zoom_start_time=zoom_start_time,

@@ -1,0 +1,19 @@
+﻿{
+  "event": "recording.completed",
+  "payload": {
+    "object": {
+      "id": 89975460107,
+      "uuid": "xo9WVYPfQ+SxbfJ+P3ZCgQ==",
+      "start_time": "2025-12-10T09:54:19Z",
+      "duration": 30,
+      "recording_files": [
+        {
+          "id": "historic-file-1",
+          "recording_type": "audio_only",
+          "file_type": "MP4",
+          "download_url": "https://ssrweb.zoom.us/replay03/2025/12/10/C68F5655-83DF-43E4-B16D-F27E3F764281/GMT20251210-095419_Recording_640x360.mp4"
+        }
+      ]
+    }
+  }
+}
