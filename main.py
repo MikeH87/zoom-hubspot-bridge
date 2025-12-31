@@ -149,7 +149,7 @@ async def recordings_proxy(meeting_id: str, file_id: str, exp: int, sig: str):
     if not download_url:
         raise HTTPException(status_code=404, detail="No download_url for recording file")
 
-    client, resp = await stream_recording_bytes(download_url)
+    client, cm, resp = await stream_recording_bytes(download_url)
 
     content_type = resp.headers.get("content-type") or "application/octet-stream"
 
@@ -158,6 +158,7 @@ async def recordings_proxy(meeting_id: str, file_id: str, exp: int, sig: str):
             async for chunk in resp.aiter_bytes():
                 yield chunk
         finally:
+            await cm.__aexit__(None, None, None)
             await client.aclose()
 
     return StreamingResponse(_iter(), media_type=content_type)
