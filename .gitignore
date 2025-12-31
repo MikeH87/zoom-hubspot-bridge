@@ -2,3 +2,12 @@
 __pycache__/
 .env
 *.pyc
+.env
+.env.*
+*.bak
+*.bak_*
+last_payload.json
+list_zoom_files.py
+patch_*.py
+fix_indent.py
+proxy_sniff_*.bin

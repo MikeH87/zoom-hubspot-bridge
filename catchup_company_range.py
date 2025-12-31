@@ -120,8 +120,8 @@ async def post_to_webhook(meeting: dict):
                     {
                         "id": (recording_files[0].get("id") if recording_files else "file-1"),
                         "recording_type": "audio_only",
-                        "download_url": recording_url,
-                    }
+                "file_type": "MP4",
+          "download_url": recording_url,}
                 ],
             }
         },
@@ -131,6 +131,9 @@ async def post_to_webhook(meeting: dict):
         return {"dry_run": True, "zoom_meeting_id": str(meeting_id), "start_time": start_time}
 
     async with httpx.AsyncClient(timeout=60.0, transport=TRANSPORT) as client:
+        import json as _json
+        with open("last_payload.json", "w", encoding="utf-8") as _f:
+            _f.write(_json.dumps(payload, indent=2))
         resp = await client.post(WEBHOOK_URL, json=payload)
         try:
             body = resp.json()
@@ -181,4 +184,5 @@ async def main():
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
+
 

@@ -104,26 +104,59 @@ def _with_access_token_param(download_url: str, access_token: str) -> str:
 async def stream_recording_bytes(download_url: str):
     """
     Stream bytes from Zoom recording download_url using OAuth token.
-    We try:
-    1) Authorization: Bearer
-    2) If that fails, retry with ?access_token=... (some setups require it)
-    Returns (response_headers, async_byte_iterator)
+
+    Zoom often returns HTTP 200 with an HTML page (login / error) instead of media.
+    If we see HTML/JSON instead of media, retry using ?access_token=... as well.
+
+    Returns (client, resp) where resp supports resp.aiter_bytes().
     """
     token = await get_zoom_access_token()
-    headers = {"Authorization": f"Bearer {token}"}
+
+    # Some Zoom endpoints behave better with a normal UA
+    bearer_headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+    }
 
     client = httpx.AsyncClient(timeout=None, follow_redirects=True)
 
-    # Attempt 1: Bearer header
-    resp = await client.get(download_url, headers=headers)
-    if resp.status_code in (401, 403):
-        # Attempt 2: access_token query param
-        alt = _with_access_token_param(download_url, token)
-        resp = await client.get(alt)
+    async def _is_probably_not_media(resp: httpx.Response) -> bool:
+        ct = (resp.headers.get("content-type") or "").lower()
 
-    if resp.status_code >= 400:
-        body = await resp.aread()
+        # If Zoom gives us HTML or JSON, it's almost certainly not the recording bytes
+        if "text/html" in ct or "application/json" in ct:
+            return True
+
+        # If content-type is missing/odd, sniff first bytes
+        try:
+            head = resp.content[:256]  # safe; response is already loaded
+        except Exception:
+            return False
+
+        s = head.lstrip()
+        if s.startswith(b"<") or s.startswith(b"<!doctype") or s.startswith(b"<!DOCTYPE"):
+            return True
+        if s.startswith(b"{") and b"error" in s[:200].lower():
+            return True
+
+        return False
+
+    # Attempt 1: Bearer header
+    resp = await client.get(download_url, headers=bearer_headers)
+
+    # If 401/403 OR we got HTML/JSON instead of media, retry with access_token param
+    if resp.status_code in (401, 403) or await _is_probably_not_media(resp):
+        alt = _with_access_token_param(download_url, token)
+        resp = await client.get(alt, headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"})
+
+    # Still bad? Raise with useful preview.
+    if resp.status_code >= 400 or await _is_probably_not_media(resp):
+        preview = resp.content[:400] if hasattr(resp, "content") else b""
         await client.aclose()
-        raise RuntimeError(f"Zoom download failed {resp.status_code}: {body[:200]!r}")
+        raise RuntimeError(
+            f"Zoom download did not return media. status={resp.status_code} "
+            f"content-type={resp.headers.get('content-type')} preview={preview!r}"
+        )
 
     return client, resp

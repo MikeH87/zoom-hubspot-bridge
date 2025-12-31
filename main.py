@@ -1,4 +1,4 @@
-﻿from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List
 import hmac
 import hashlib
 import time
@@ -42,43 +42,49 @@ def _extract_duration_ms(zoom_object: Dict[str, Any]) -> int:
         return 0
 
 
-def _choose_media_recording_file(recording_files: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _choose_media_recording_file(recording_files):
     """
-    Selection rules:
-    - Only accept file_type in: M4A (preferred), MP4, MP3, WAV
-    - Ignore transcript/JSON/TXT/VTT/CHAT etc by file_type filter
-    - Prefer audio_only recordings first (and M4A if present)
-    - Otherwise choose the smallest MP4 (by file_size if present)
+    Choose the *actual media* recording file from Zoom payloads.
+
+    Prefer real audio/video (MP4/M4A/MP3/WAV) and avoid transcript/summary/timeline.
+    This prevents streaming WEBVTT/JSON into the AI worker.
     """
     if not recording_files:
         return None
 
+    files = [f for f in recording_files if isinstance(f, dict)]
+
+    # Prefer explicit media file types first
     media = []
-    for rf in recording_files:
-        ft = (rf.get("file_type") or "").upper().strip()
-        if ft in ALLOWED_MEDIA_FILE_TYPES:
-            media.append(rf)
+    for f in files:
+        ft = (f.get('file_type') or f.get('file_extension') or '').upper()
+        rt = (f.get('recording_type') or '').lower()
 
-    if not media:
-        return None
+        # Exclude non-media
+        if ft in {'TRANSCRIPT','SUMMARY','TIMELINE','CHAT','CC','TXT','VTT','JSON'}:
+            continue
+        if rt in {'audio_transcript','transcript','summary','timeline','chat_file','closed_caption'}:
+            continue
 
-    audio_only = [rf for rf in media if (rf.get("recording_type") == "audio_only")]
-    if audio_only:
-        m4a = [rf for rf in audio_only if (str(rf.get("file_type") or "").upper() == "M4A")]
-        return m4a[0] if m4a else audio_only[0]
+        if ft in {'MP4','M4A','MP3','WAV'}:
+            media.append(f)
 
-    mp4s = [rf for rf in media if (str(rf.get("file_type") or "").upper() == "MP4")]
-    if mp4s:
-        def size_or_big(x: Dict[str, Any]) -> int:
-            try:
-                return int(x.get("file_size") or 10**18)
-            except Exception:
-                return 10**18
-        mp4s.sort(key=size_or_big)
-        return mp4s[0]
+    # Prefer audio_only if present
+    if media:
+        for f in media:
+            if (f.get('recording_type') or '').lower() == 'audio_only':
+                return f
+        return media[0]
 
-    return media[0]
+    # Fallback: first thing with a URL that isn't transcript-ish
+    for f in files:
+        rt = (f.get('recording_type') or '').lower()
+        if rt in {'audio_transcript','transcript','summary','timeline','chat_file','closed_caption'}:
+            continue
+        if f.get('download_url') or f.get('play_url'):
+            return f
 
+    return None
 
 def _zoom_encrypted_token(plain_token: str) -> str:
     if not ZOOM_WEBHOOK_SECRET_TOKEN:
@@ -184,8 +190,11 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Zoom meeting ID is missing")
 
     # STRICT media selection (from payload)
-    recording_files = zoom_object.get("recording_files") or []
+    # Always pull the authoritative recording file list from Zoom API (webhook payload can be incomplete)
+    data = await get_meeting_recordings(str(zoom_meeting_id))
+    recording_files = data.get("recording_files") or []
     chosen = _choose_media_recording_file(recording_files)
+
     if not chosen:
         print(f"No media recording file found for meeting {zoom_meeting_id}")
         return {"status": "ignored_no_media_recording_file", "zoom_meeting_id": zoom_meeting_id}

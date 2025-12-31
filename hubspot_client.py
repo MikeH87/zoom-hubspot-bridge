@@ -30,6 +30,7 @@ async def search_meeting_by_zoom_id(zoom_meeting_id: str) -> Optional[dict]:
         "properties": [
             "hs_activity_type",
             "hs_meeting_location",
+            "hubspot_owner_id",
         ],
         "limit": 5,
     }
@@ -156,6 +157,12 @@ async def create_call_for_meeting(
         "integration_call": True,
         "hs_call_duration": duration_ms if duration_ms is not None else 0,
     }
+
+    # Copy owner from the source Meeting onto the created Call (so the scorecard inherits it)
+    meeting_props = (meeting.get("properties") or {}) if isinstance(meeting, dict) else {}
+    owner_id = meeting_props.get("hubspot_owner_id") or meeting_props.get("hs_owner_id")
+    if owner_id:
+        properties["hubspot_owner_id"] = str(owner_id)
 
     if disposition:
         properties["hs_call_disposition"] = disposition

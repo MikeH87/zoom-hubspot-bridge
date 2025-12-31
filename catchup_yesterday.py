@@ -63,7 +63,7 @@ async def post_to_webhook(meeting: dict) -> dict:
                     {
                         "id": recording_files[0].get("id", "file-1") if recording_files else "file-1",
                         "recording_type": "audio_only",
-                        "download_url": recording_url,
+                "file_extension": "MP4",
                     }
                 ],
             }
@@ -104,4 +104,5 @@ async def main():
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
+
 
