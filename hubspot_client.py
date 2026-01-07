@@ -1,4 +1,4 @@
-﻿import datetime
+import datetime
 from typing import List, Optional
 
 import httpx
@@ -210,3 +210,29 @@ async def associate_call_to_deals(call_id: str, deal_ids: List[str]) -> None:
         print("Error associating call to deals (default):")
         print("Status:", resp.status_code)
         print("Body:", resp.text)
+
+async def find_existing_call_by_zoom_meeting_id(zoom_meeting_id: str) -> Optional[dict]:
+    """
+    Idempotency helper: checks whether we've already created an integration call for this Zoom meeting.
+    Returns the first matching HubSpot call object (dict) or None.
+    """
+    url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/calls/search"
+    payload = {
+        "filterGroups": [{
+            "filters": [
+                {"propertyName": "zoom_meeting_id", "operator": "EQ", "value": str(zoom_meeting_id)},
+                {"propertyName": "integration_call", "operator": "EQ", "value": "true"},
+            ]
+        }],
+        "properties": ["zoom_meeting_id", "integration_call", "hs_timestamp", "hs_call_recording_url"],
+        "limit": 1,
+        "sorts": ["-hs_timestamp"],
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(url, json=payload, headers=HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+
+    results = data.get("results") or []
+    return results[0] if results else None

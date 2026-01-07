@@ -1,3 +1,4 @@
+from hubspot_client import find_existing_call_by_zoom_meeting_id
 from typing import Any, Dict, Optional, List
 import hmac
 import hashlib
@@ -176,11 +177,9 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
         if not plain_token:
             raise HTTPException(status_code=400, detail="plainToken missing in validation payload")
         return {"plainToken": plain_token, "encryptedToken": _zoom_encrypted_token(plain_token)}
-
-    # Recording events only
-    if not zoom_event or "recording" not in zoom_event:
-        raise HTTPException(status_code=400, detail="Not a recording event")
-
+    # Only create calls when the recording is actually completed
+    if zoom_event != "recording.completed":
+        return {"status": "ignored_event", "event": zoom_event}
     zoom_object = (payload.get("payload") or {}).get("object") or {}
 
     zoom_meeting_id = str(zoom_object.get("id") or "")
@@ -252,6 +251,13 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
             print("Error:", repr(e))
 
     duration_ms = _extract_duration_ms(zoom_object)
+
+    existing_call = await find_existing_call_by_zoom_meeting_id(zoom_meeting_id)
+
+    if existing_call:
+
+        return {"status": "duplicate_ignored", "hubspot_call_id": existing_call.get("id")}
+
 
     call = await create_call_for_meeting(
         meeting=meeting,
