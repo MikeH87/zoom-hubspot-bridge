@@ -17,6 +17,7 @@ from hubspot_client import (
     get_contact_name,
     associate_call_to_contacts,
     associate_call_to_deals,
+    mark_meeting_completed,
 )
 from zoom_client import get_participant_count, get_meeting_recordings, stream_recording_bytes
 
@@ -275,6 +276,11 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
 
     await associate_call_to_contacts(call_id, contact_ids)
     await associate_call_to_deals(call_id, deal_ids)
+
+    try:
+        await mark_meeting_completed(meeting_id)
+    except Exception as e:
+        print(f"Failed to mark meeting {meeting_id} as completed:", repr(e))
 
     return {
         "status": "ok",

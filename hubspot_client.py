@@ -236,3 +236,11 @@ async def find_existing_call_by_zoom_meeting_id(zoom_meeting_id: str) -> Optiona
 
     results = data.get("results") or []
     return results[0] if results else None
+
+async def mark_meeting_completed(meeting_id: str) -> None:
+    url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/meetings/{meeting_id}"
+    payload = {"properties": {"hs_meeting_outcome": "COMPLETED"}}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.patch(url, json=payload, headers=HEADERS)
+        resp.raise_for_status()
