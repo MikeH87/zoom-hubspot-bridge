@@ -1,5 +1,5 @@
 import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Iterable
 
 import httpx
 
@@ -118,6 +118,75 @@ async def get_meeting_deal_ids(meeting_id: str) -> List[str]:
     return deal_ids
 
 
+async def get_contact_deal_ids(contact_id: str) -> List[str]:
+    url = f"{HUBSPOT_BASE_URL}/crm/v4/objects/contacts/{contact_id}/associations/deals"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(url, headers=HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+
+    results = data.get("results") or []
+    deal_ids: List[str] = []
+
+    for row in results:
+        to_id = row.get("toObjectId")
+        if to_id is not None:
+            deal_ids.append(str(to_id))
+
+    return deal_ids
+
+
+async def get_deals(deal_ids: Iterable[str]) -> List[Dict]:
+    ids = [str(i) for i in deal_ids if i]
+    if not ids:
+        return []
+
+    url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/deals/batch/read"
+    payload = {
+        "properties": ["dealstage", "hs_lastmodifieddate"],
+        "inputs": [{"id": i} for i in ids],
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(url, json=payload, headers=HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+
+    return data.get("results") or []
+
+
+def _deal_last_modified_ms(deal: Dict) -> int:
+    props = deal.get("properties") or {}
+    raw = props.get("hs_lastmodifieddate") or "0"
+    try:
+        return int(raw)
+    except Exception:
+        return 0
+
+
+async def get_latest_deal(deal_ids: Iterable[str]) -> Optional[Dict]:
+    deals = await get_deals(deal_ids)
+    if not deals:
+        return None
+    deals.sort(key=_deal_last_modified_ms, reverse=True)
+    return deals[0]
+
+
+async def get_latest_deal_from_contacts(contact_ids: Iterable[str]) -> Optional[Dict]:
+    unique_ids = set()
+    for cid in contact_ids:
+        if not cid:
+            continue
+        try:
+            ids = await get_contact_deal_ids(str(cid))
+            unique_ids.update(ids)
+        except Exception as e:
+            print("Error fetching deals for contact:", cid, repr(e))
+
+    return await get_latest_deal(unique_ids)
+
+
 async def create_call_for_meeting(
     *,
     meeting: dict,
@@ -211,6 +280,22 @@ async def associate_call_to_deals(call_id: str, deal_ids: List[str]) -> None:
         print("Status:", resp.status_code)
         print("Body:", resp.text)
 
+
+async def associate_meeting_to_deals(meeting_id: str, deal_ids: List[str]) -> None:
+    if not deal_ids:
+        return
+
+    url = f"{HUBSPOT_BASE_URL}/crm/associations/2025-09/Meetings/Deals/batch/associate/default"
+    payload = {"inputs": [{"from": {"id": meeting_id}, "to": {"id": did}} for did in deal_ids]}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(url, json=payload, headers=HEADERS)
+
+    if resp.status_code >= 400:
+        print("Error associating meeting to deals (default):")
+        print("Status:", resp.status_code)
+        print("Body:", resp.text)
+
 async def find_existing_call_by_zoom_meeting_id(zoom_meeting_id: str) -> Optional[dict]:
     """
     Idempotency helper: checks whether we've already created an integration call for this Zoom meeting.
@@ -240,6 +325,15 @@ async def find_existing_call_by_zoom_meeting_id(zoom_meeting_id: str) -> Optiona
 async def mark_meeting_completed(meeting_id: str) -> None:
     url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/meetings/{meeting_id}"
     payload = {"properties": {"hs_meeting_outcome": "COMPLETED"}}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.patch(url, json=payload, headers=HEADERS)
+        resp.raise_for_status()
+
+
+async def update_deal_stage(deal_id: str, dealstage: str) -> None:
+    url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/deals/{deal_id}"
+    payload = {"properties": {"dealstage": str(dealstage)}}
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.patch(url, json=payload, headers=HEADERS)
