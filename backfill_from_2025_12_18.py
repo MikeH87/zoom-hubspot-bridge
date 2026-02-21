@@ -3,7 +3,16 @@ import json
 import datetime
 import httpx
 
+from dotenv import load_dotenv
+
 from zoom_client import get_zoom_access_token
+from hubspot_client import (
+    search_meeting_by_zoom_id,
+    get_meeting_contact_ids,
+    get_meeting_deal_ids,
+    get_latest_deal,
+    get_latest_deal_from_contacts,
+)
 
 ZOOM_API = "https://api.zoom.us/v2"
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://zoom-hubspot-bridge.onrender.com/zoom/recording-webhook")
@@ -14,6 +23,21 @@ TRANSPORT = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
 FROM_DATE = os.getenv("FROM_DATE", "2025-12-18")
 TO_DATE = os.getenv("TO_DATE", datetime.date.today().isoformat())
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
+ONLY_CHANGES = os.getenv("ONLY_CHANGES", "1") == "1"
+
+# Deal stages
+DEAL_STAGE_QUALIFIED = "1054943518"  # Qualified (Zoom call arranged)
+DEAL_STAGE_FOLLOWUP = "1054943519"   # Followup (Zoom call completed)
+DEAL_STAGE_SENT_CLIENT_AGREEMENT = "1054943520"
+DEAL_STAGE_AGREEMENT_SIGNED = "1054943521"
+DEAL_STAGE_CLOSED_LOST = "1054943524"
+DEAL_STAGE_CANCELLED = "1080046258"
+
+PROTECTED_DEAL_STAGES = {
+    DEAL_STAGE_SENT_CLIENT_AGREEMENT,
+    DEAL_STAGE_AGREEMENT_SIGNED,
+    DEAL_STAGE_CANCELLED,
+}
 
 ALLOWED_MEDIA_FILE_TYPES = {"M4A", "MP4", "MP3", "WAV"}
 
@@ -144,9 +168,120 @@ async def post_to_webhook(meeting: dict):
         return {"status_code": resp.status_code, "body": body, "zoom_meeting_id": str(meeting_id)}
 
 
+def _stage_from_deal(deal: dict | None) -> str | None:
+    if not deal:
+        return None
+    props = deal.get("properties") or {}
+    return props.get("dealstage")
+
+
+async def preview_actions_for_meeting(meeting: dict) -> dict:
+    meeting_id = str(meeting.get("id") or "")
+    start_time = meeting.get("start_time")
+
+    hs_meeting = await search_meeting_by_zoom_id(meeting_id)
+    if not hs_meeting:
+        return {
+            "zoom_meeting_id": meeting_id,
+            "start_time": start_time,
+            "action": "no_hubspot_meeting",
+        }
+
+    hs_meeting_id = str(hs_meeting.get("id") or "")
+    contact_ids = await get_meeting_contact_ids(hs_meeting_id)
+    deal_ids = await get_meeting_deal_ids(hs_meeting_id)
+
+    latest_meeting_deal = await get_latest_deal(deal_ids)
+    if latest_meeting_deal:
+        deal_id = str(latest_meeting_deal.get("id") or "")
+        stage = _stage_from_deal(latest_meeting_deal)
+
+        if stage in PROTECTED_DEAL_STAGES:
+            return {
+                "zoom_meeting_id": meeting_id,
+                "start_time": start_time,
+                "hubspot_meeting_id": hs_meeting_id,
+                "deal_id": deal_id,
+                "deal_stage": stage,
+                "action": "skip_protected_stage",
+            }
+        if stage == DEAL_STAGE_QUALIFIED:
+            return {
+                "zoom_meeting_id": meeting_id,
+                "start_time": start_time,
+                "hubspot_meeting_id": hs_meeting_id,
+                "deal_id": deal_id,
+                "deal_stage": stage,
+                "action": "update_stage",
+                "to_stage": DEAL_STAGE_FOLLOWUP,
+                "via": "meeting_deal",
+            }
+        return {
+            "zoom_meeting_id": meeting_id,
+            "start_time": start_time,
+            "hubspot_meeting_id": hs_meeting_id,
+            "deal_id": deal_id,
+            "deal_stage": stage,
+            "action": "skip_not_eligible",
+        }
+
+    # Fallback: latest deal from contact associations
+    contact_deal = await get_latest_deal_from_contacts(contact_ids)
+    if not contact_deal:
+        return {
+            "zoom_meeting_id": meeting_id,
+            "start_time": start_time,
+            "hubspot_meeting_id": hs_meeting_id,
+            "action": "no_deal_found",
+        }
+
+    deal_id = str(contact_deal.get("id") or "")
+    stage = _stage_from_deal(contact_deal)
+
+    if stage in PROTECTED_DEAL_STAGES:
+        return {
+            "zoom_meeting_id": meeting_id,
+            "start_time": start_time,
+            "hubspot_meeting_id": hs_meeting_id,
+            "deal_id": deal_id,
+            "deal_stage": stage,
+            "action": "associate_only_protected_stage",
+            "associate_call": True,
+            "associate_meeting": True,
+            "via": "contact_deal",
+        }
+
+    if stage in {DEAL_STAGE_QUALIFIED, DEAL_STAGE_CLOSED_LOST}:
+        return {
+            "zoom_meeting_id": meeting_id,
+            "start_time": start_time,
+            "hubspot_meeting_id": hs_meeting_id,
+            "deal_id": deal_id,
+            "deal_stage": stage,
+            "action": "associate_and_update_stage",
+            "associate_call": True,
+            "associate_meeting": True,
+            "to_stage": DEAL_STAGE_FOLLOWUP,
+            "via": "contact_deal",
+        }
+
+    return {
+        "zoom_meeting_id": meeting_id,
+        "start_time": start_time,
+        "hubspot_meeting_id": hs_meeting_id,
+        "deal_id": deal_id,
+        "deal_stage": stage,
+        "action": "associate_only_not_eligible",
+        "associate_call": True,
+        "associate_meeting": True,
+        "via": "contact_deal",
+    }
+
+
 async def main():
+    load_dotenv()
     print(f"Backfill date range: {FROM_DATE} to {TO_DATE}")
-    print(f"DRY_RUN={DRY_RUN}")
+    print(f"DRY_RUN={DRY_RUN} ONLY_CHANGES={ONLY_CHANGES}")
 
     users = await list_users()
     print(f"Found {len(users)} users")
@@ -172,7 +307,19 @@ async def main():
     results = []
     for m in all_meetings:
         try:
-            res = await post_to_webhook(m)
+            if DRY_RUN:
+                res = await preview_actions_for_meeting(m)
+                if ONLY_CHANGES:
+                    action = res.get("action")
+                    if action not in {
+                        "update_stage",
+                        "associate_and_update_stage",
+                        "associate_only_protected_stage",
+                        "associate_only_not_eligible",
+                    }:
+                        continue
+            else:
+                res = await post_to_webhook(m)
         except Exception as e:
             res = {"error": repr(e), "zoom_meeting_id": str(m.get("id") or "")}
         results.append(res)
