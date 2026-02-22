@@ -17,9 +17,8 @@ from hubspot_client import (
     get_contact_name,
     associate_call_to_contacts,
     associate_call_to_deals,
-    associate_meeting_to_deals,
+    get_call_deal_ids,
     get_latest_deal,
-    get_latest_deal_from_contacts,
     update_deal_stage,
     mark_meeting_completed,
 )
@@ -295,12 +294,13 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
     await associate_call_to_contacts(call_id, contact_ids)
     await associate_call_to_deals(call_id, deal_ids)
 
-    # Deal stage update logic
+    # Deal stage update logic (only call-associated deals)
     try:
-        latest_meeting_deal = await get_latest_deal(deal_ids)
+        call_deal_ids = await get_call_deal_ids(call_id)
+        latest_call_deal = await get_latest_deal(call_deal_ids)
     except Exception as e:
-        print("Failed to fetch meeting-associated deals:", repr(e))
-        latest_meeting_deal = None
+        print("Failed to fetch call-associated deals:", repr(e))
+        latest_call_deal = None
 
     def _stage_from_deal(deal: Optional[dict]) -> Optional[str]:
         if not deal:
@@ -311,9 +311,9 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
     updated_deal_id = None
     updated_deal_stage = None
 
-    if latest_meeting_deal:
-        stage = _stage_from_deal(latest_meeting_deal)
-        deal_id = str(latest_meeting_deal.get("id") or "")
+    if latest_call_deal:
+        stage = _stage_from_deal(latest_call_deal)
+        deal_id = str(latest_call_deal.get("id") or "")
 
         if stage in PROTECTED_DEAL_STAGES:
             print(f"Skipping protected deal stage for deal {deal_id}: {stage}")
@@ -322,33 +322,9 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
             updated_deal_id = deal_id
             updated_deal_stage = DEAL_STAGE_FOLLOWUP
         else:
-            print(f"Deal stage not eligible for update (meeting-associated): {stage}")
+            print(f"Deal stage not eligible for update (call-associated): {stage}")
     else:
-        # Fallback: find deal via contact associations
-        try:
-            contact_deal = await get_latest_deal_from_contacts(contact_ids)
-        except Exception as e:
-            print("Failed to fetch contact-associated deals:", repr(e))
-            contact_deal = None
-
-        if contact_deal:
-            deal_id = str(contact_deal.get("id") or "")
-            stage = _stage_from_deal(contact_deal)
-
-            # Associate the deal to both call and meeting
-            await associate_call_to_deals(call_id, [deal_id])
-            await associate_meeting_to_deals(meeting_id, [deal_id])
-
-            if stage in PROTECTED_DEAL_STAGES:
-                print(f"Skipping protected deal stage for deal {deal_id}: {stage}")
-            elif stage == DEAL_STAGE_QUALIFIED:
-                await update_deal_stage(deal_id, DEAL_STAGE_FOLLOWUP)
-                updated_deal_id = deal_id
-                updated_deal_stage = DEAL_STAGE_FOLLOWUP
-            else:
-                print(f"Deal stage not eligible for update (contact fallback): {stage}")
-        else:
-            print("No deal found via meeting or contact associations; skipping deal update.")
+        print("No call-associated deal found; skipping deal update.")
 
     try:
         await mark_meeting_completed(meeting_id)
