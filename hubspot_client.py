@@ -118,6 +118,25 @@ async def get_meeting_deal_ids(meeting_id: str) -> List[str]:
     return deal_ids
 
 
+async def get_call_deal_ids(call_id: str) -> List[str]:
+    url = f"{HUBSPOT_BASE_URL}/crm/v4/objects/calls/{call_id}/associations/deals"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(url, headers=HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+
+    results = data.get("results") or []
+    deal_ids: List[str] = []
+
+    for row in results:
+        to_id = row.get("toObjectId")
+        if to_id is not None:
+            deal_ids.append(str(to_id))
+
+    return deal_ids
+
+
 async def get_contact_deal_ids(contact_id: str) -> List[str]:
     url = f"{HUBSPOT_BASE_URL}/crm/v4/objects/contacts/{contact_id}/associations/deals"
 

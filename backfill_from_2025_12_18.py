@@ -10,8 +10,10 @@ from hubspot_client import (
     search_meeting_by_zoom_id,
     get_meeting_contact_ids,
     get_meeting_deal_ids,
+    get_call_deal_ids,
     get_latest_deal,
     get_latest_deal_from_contacts,
+    find_existing_call_by_zoom_meeting_id,
 )
 
 ZOOM_API = "https://api.zoom.us/v2"
@@ -190,6 +192,9 @@ async def preview_actions_for_meeting(meeting: dict) -> dict:
     hs_meeting_id = str(hs_meeting.get("id") or "")
     contact_ids = await get_meeting_contact_ids(hs_meeting_id)
     deal_ids = await get_meeting_deal_ids(hs_meeting_id)
+    existing_call = await find_existing_call_by_zoom_meeting_id(meeting_id)
+    call_id = str(existing_call.get("id")) if existing_call else None
+    call_deal_ids = await get_call_deal_ids(call_id) if call_id else []
 
     latest_meeting_deal = await get_latest_deal(deal_ids)
     if latest_meeting_deal:
@@ -201,6 +206,7 @@ async def preview_actions_for_meeting(meeting: dict) -> dict:
                 "zoom_meeting_id": meeting_id,
                 "start_time": start_time,
                 "hubspot_meeting_id": hs_meeting_id,
+                "hubspot_call_id": call_id,
                 "deal_id": deal_id,
                 "deal_stage": stage,
                 "action": "skip_protected_stage",
@@ -210,6 +216,7 @@ async def preview_actions_for_meeting(meeting: dict) -> dict:
                 "zoom_meeting_id": meeting_id,
                 "start_time": start_time,
                 "hubspot_meeting_id": hs_meeting_id,
+                "hubspot_call_id": call_id,
                 "deal_id": deal_id,
                 "deal_stage": stage,
                 "action": "update_stage",
@@ -220,6 +227,7 @@ async def preview_actions_for_meeting(meeting: dict) -> dict:
             "zoom_meeting_id": meeting_id,
             "start_time": start_time,
             "hubspot_meeting_id": hs_meeting_id,
+            "hubspot_call_id": call_id,
             "deal_id": deal_id,
             "deal_stage": stage,
             "action": "skip_not_eligible",
@@ -232,48 +240,88 @@ async def preview_actions_for_meeting(meeting: dict) -> dict:
             "zoom_meeting_id": meeting_id,
             "start_time": start_time,
             "hubspot_meeting_id": hs_meeting_id,
+            "hubspot_call_id": call_id,
             "action": "no_deal_found",
         }
 
     deal_id = str(contact_deal.get("id") or "")
     stage = _stage_from_deal(contact_deal)
+    associate_call = True if not call_id else (deal_id not in call_deal_ids)
+    associate_meeting = deal_id not in deal_ids
 
     if stage in PROTECTED_DEAL_STAGES:
+        if not associate_call and not associate_meeting:
+            return {
+                "zoom_meeting_id": meeting_id,
+                "start_time": start_time,
+                "hubspot_meeting_id": hs_meeting_id,
+                "hubspot_call_id": call_id,
+                "deal_id": deal_id,
+                "deal_stage": stage,
+                "action": "no_change",
+                "via": "contact_deal",
+            }
         return {
             "zoom_meeting_id": meeting_id,
             "start_time": start_time,
             "hubspot_meeting_id": hs_meeting_id,
+            "hubspot_call_id": call_id,
             "deal_id": deal_id,
             "deal_stage": stage,
             "action": "associate_only_protected_stage",
-            "associate_call": True,
-            "associate_meeting": True,
+            "associate_call": associate_call,
+            "associate_meeting": associate_meeting,
             "via": "contact_deal",
         }
 
-    if stage in {DEAL_STAGE_QUALIFIED, DEAL_STAGE_CLOSED_LOST}:
+    if stage == DEAL_STAGE_QUALIFIED:
+        if not associate_call and not associate_meeting:
+            return {
+                "zoom_meeting_id": meeting_id,
+                "start_time": start_time,
+                "hubspot_meeting_id": hs_meeting_id,
+                "hubspot_call_id": call_id,
+                "deal_id": deal_id,
+                "deal_stage": stage,
+                "action": "update_stage",
+                "to_stage": DEAL_STAGE_FOLLOWUP,
+                "via": "contact_deal",
+            }
         return {
             "zoom_meeting_id": meeting_id,
             "start_time": start_time,
             "hubspot_meeting_id": hs_meeting_id,
+            "hubspot_call_id": call_id,
             "deal_id": deal_id,
             "deal_stage": stage,
             "action": "associate_and_update_stage",
-            "associate_call": True,
-            "associate_meeting": True,
+            "associate_call": associate_call,
+            "associate_meeting": associate_meeting,
             "to_stage": DEAL_STAGE_FOLLOWUP,
             "via": "contact_deal",
         }
 
+    if not associate_call and not associate_meeting:
+        return {
+            "zoom_meeting_id": meeting_id,
+            "start_time": start_time,
+            "hubspot_meeting_id": hs_meeting_id,
+            "hubspot_call_id": call_id,
+            "deal_id": deal_id,
+            "deal_stage": stage,
+            "action": "no_change",
+            "via": "contact_deal",
+        }
     return {
         "zoom_meeting_id": meeting_id,
         "start_time": start_time,
         "hubspot_meeting_id": hs_meeting_id,
+        "hubspot_call_id": call_id,
         "deal_id": deal_id,
         "deal_stage": stage,
         "action": "associate_only_not_eligible",
-        "associate_call": True,
-        "associate_meeting": True,
+        "associate_call": associate_call,
+        "associate_meeting": associate_meeting,
         "via": "contact_deal",
     }
 

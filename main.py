@@ -341,7 +341,7 @@ async def zoom_recording_webhook(request: Request) -> Dict[str, Any]:
 
             if stage in PROTECTED_DEAL_STAGES:
                 print(f"Skipping protected deal stage for deal {deal_id}: {stage}")
-            elif stage in {DEAL_STAGE_QUALIFIED, DEAL_STAGE_CLOSED_LOST}:
+            elif stage == DEAL_STAGE_QUALIFIED:
                 await update_deal_stage(deal_id, DEAL_STAGE_FOLLOWUP)
                 updated_deal_id = deal_id
                 updated_deal_stage = DEAL_STAGE_FOLLOWUP
